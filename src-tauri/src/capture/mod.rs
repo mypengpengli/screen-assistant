@@ -4,15 +4,17 @@ mod scheduler;
 pub use screen::*;
 pub use scheduler::*;
 
-use crate::model::ModelManager;
+use crate::model::{build_model_error_alert, ModelManager};
 use crate::storage::{Config, StorageManager, SummaryRecord};
-use chrono::Local;
+use chrono::{Duration, Local};
 use image::DynamicImage;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+
+const RECENT_CONTEXT_MINUTES: i64 = 3;
 
 pub struct CaptureManager {
     is_running: Arc<ParkingMutex<bool>>,
@@ -183,27 +185,50 @@ async fn capture_and_analyze_with_diff(
     let image_base64 = ScreenCapture::image_to_base64(&image, config.capture.compress_quality)?;
 
     // 4. 发送给大模型识别
-    let prompt = r#"请分析这个屏幕截图，返回JSON格式：
-{
+    let recent_context = build_recent_summary_context(
+        storage_manager,
+        config.capture.recent_summary_limit,
+    );
+    let prompt = format!(
+        r#"请分析这个屏幕截图，返回JSON格式：
+{{
   "summary": "一句话描述当前操作",
   "app": "应用程序名称",
-  "has_error": true/false,
-  "error_type": "错误类型（如果有）",
-  "error_message": "错误信息摘要（如果有）",
-  "suggestion": "解决建议（如果有错误）"
-}
+  "has_issue": true/false,
+  "issue_type": "困难/问题类型（如果有）",
+  "issue_summary": "困难/问题摘要（如果有）",
+  "suggestion": "解决建议（如果有）",
+  "confidence": 0.0-1.0
+}}
 
 重点检测：
-- 编程错误（编译错误、运行时错误、语法错误）
-- 命令行报错
-- 弹窗错误提示
-- 网页错误页面
+- 编程错误或异常（编译错误、运行时错误、语法错误）
+- 命令行报错或失败
+- 弹窗提示导致无法继续
+- 网页错误页面或加载失败
+- 明显的“找不到”“无法完成”的困难
 
-如果没有错误，has_error设为false，error相关字段留空。"#;
+注意：
+- 只有在截图或近期记录中有明确线索时，才判定为困难
+- confidence 反映你对判断的确定度（0-1）
 
-    let analysis = model_manager
+近期记录（仅供参考，可能不完整）：
+{}
+
+如果没有明确困难，has_issue设为false，issue相关字段留空。"#,
+        recent_context
+    );
+
+    let analysis = match model_manager
         .analyze_image(&config.model, &image_base64, prompt)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            emit_model_error_once(recent_alerts, app_handle, &err, "capture");
+            return Err(err);
+        }
+    };
 
     // 5. 解析分析结果
     let parsed = parse_analysis(&analysis);
@@ -215,16 +240,17 @@ async fn capture_and_analyze_with_diff(
         timestamp: timestamp.clone(),
         summary: parsed.summary.clone(),
         app: parsed.app.clone(),
-        action: if parsed.has_error { "error".to_string() } else { "active".to_string() },
+        action: if parsed.has_issue { "issue".to_string() } else { "active".to_string() },
         keywords: extract_keywords_from_analysis(&parsed.summary),
+        confidence: parsed.confidence,
         detail_ref: String::new(),
     };
 
     storage_manager.save_summary(&summary)?;
 
-    // 7. 如果检测到错误，主动推送提示
-    if parsed.has_error {
-        let error_key = format!("{}:{}", parsed.error_type, parsed.error_message);
+    // 7. 如果检测到困难，主动推送提示
+    if parsed.has_issue {
+        let error_key = format!("{}:{}", parsed.issue_type, parsed.issue_message);
 
         let should_alert = {
             let mut alerts = recent_alerts.lock();
@@ -239,8 +265,8 @@ async fn capture_and_analyze_with_diff(
         if should_alert {
             let alert_message = AssistantAlert {
                 timestamp: timestamp.clone(),
-                error_type: parsed.error_type,
-                message: parsed.error_message,
+                issue_type: parsed.issue_type,
+                message: parsed.issue_message,
                 suggestion: parsed.suggestion,
             };
 
@@ -254,45 +280,96 @@ async fn capture_and_analyze_with_diff(
 #[derive(Clone, serde::Serialize)]
 pub struct AssistantAlert {
     pub timestamp: String,
-    pub error_type: String,
+    pub issue_type: String,
     pub message: String,
     pub suggestion: String,
+}
+
+fn emit_model_error_once(
+    recent_alerts: &Arc<ParkingMutex<HashSet<String>>>,
+    app_handle: &AppHandle,
+    detail: &str,
+    source: &str,
+) {
+    let alert = build_model_error_alert(detail, source);
+    let key = format!("model:{}:{}", &alert.error_type, &alert.message);
+
+    let should_emit = {
+        let mut alerts = recent_alerts.lock();
+        if alerts.contains(&key) {
+            false
+        } else {
+            alerts.insert(key);
+            true
+        }
+    };
+
+    if should_emit {
+        let _ = app_handle.emit("model-error", alert);
+    }
 }
 
 #[derive(Default)]
 struct AnalysisResult {
     summary: String,
     app: String,
-    has_error: bool,
-    error_type: String,
-    error_message: String,
+    has_issue: bool,
+    issue_type: String,
+    issue_message: String,
     suggestion: String,
+    confidence: f32,
 }
 
 fn parse_analysis(analysis: &str) -> AnalysisResult {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(analysis) {
+        let has_issue = json
+            .get("has_issue")
+            .and_then(|v| v.as_bool())
+            .or_else(|| json.get("has_error").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        let issue_type = json
+            .get("issue_type")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("error_type").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let issue_message = json
+            .get("issue_summary")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let confidence = parse_confidence(&json, has_issue);
+
         return AnalysisResult {
             summary: json.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             app: json.get("app").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
-            has_error: json.get("has_error").and_then(|v| v.as_bool()).unwrap_or(false),
-            error_type: json.get("error_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            error_message: json.get("error_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            has_issue,
+            issue_type,
+            issue_message,
             suggestion: json.get("suggestion").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            confidence,
         };
     }
 
-    let has_error = analysis.to_lowercase().contains("error")
+    let has_issue = analysis.to_lowercase().contains("error")
         || analysis.contains("错误")
         || analysis.contains("失败")
-        || analysis.contains("异常");
+        || analysis.contains("异常")
+        || analysis.contains("无法")
+        || analysis.contains("找不到")
+        || analysis.contains("未找到")
+        || analysis.contains("卡住")
+        || analysis.contains("无响应");
 
     AnalysisResult {
         summary: analysis.lines().next().unwrap_or(analysis).to_string(),
         app: extract_app_from_text(analysis),
-        has_error,
-        error_type: if has_error { "detected".to_string() } else { String::new() },
-        error_message: if has_error { analysis.to_string() } else { String::new() },
+        has_issue,
+        issue_type: if has_issue { "detected".to_string() } else { String::new() },
+        issue_message: if has_issue { analysis.to_string() } else { String::new() },
         suggestion: String::new(),
+        confidence: if has_issue { 0.4 } else { 0.2 },
     }
 }
 
@@ -323,7 +400,10 @@ fn extract_keywords_from_analysis(analysis: &str) -> Vec<String> {
         }
     }
 
-    let actions = ["编辑", "浏览", "搜索", "调试", "运行", "编写", "阅读", "聊天", "错误", "报错"];
+    let actions = [
+        "编辑", "浏览", "搜索", "调试", "运行", "编写", "阅读", "聊天",
+        "错误", "报错", "困难", "无法", "找不到", "未找到", "卡住", "无响应",
+    ];
     for action in actions {
         if analysis.contains(action) {
             keywords.push(action.to_string());
@@ -331,4 +411,61 @@ fn extract_keywords_from_analysis(analysis: &str) -> Vec<String> {
     }
 
     keywords
+}
+
+fn build_recent_summary_context(storage_manager: &StorageManager, max_items: usize) -> String {
+    let now = Local::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let cutoff = (now - Duration::minutes(RECENT_CONTEXT_MINUTES))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+
+    let records = match storage_manager.get_summaries(&date) {
+        Ok(data) => data,
+        Err(_) => return "（无）".to_string(),
+    };
+
+    let mut recent: Vec<_> = records
+        .into_iter()
+        .filter(|r| r.timestamp >= cutoff)
+        .collect();
+
+    if recent.is_empty() {
+        return "（无）".to_string();
+    }
+
+    let max_items = max_items.clamp(1, 100);
+    recent.reverse();
+    let mut recent = recent.into_iter().take(max_items).collect::<Vec<_>>();
+    recent.reverse();
+
+    recent
+        .into_iter()
+        .map(|record| {
+            let time = record.timestamp.get(11..19).unwrap_or(&record.timestamp);
+            let app = if record.app.is_empty() || record.app == "Unknown" {
+                String::new()
+            } else {
+                format!(" [{}]", record.app)
+            };
+            format!("- {}{} {}", time, app, record.summary)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_confidence(json: &serde_json::Value, has_issue: bool) -> f32 {
+    let fallback = if has_issue { 0.5 } else { 0.2 };
+    let value = match json.get("confidence") {
+        Some(serde_json::Value::Number(num)) => num.as_f64().unwrap_or(fallback as f64) as f32,
+        Some(serde_json::Value::String(text)) => match text.to_lowercase().as_str() {
+            "high" => 0.9,
+            "medium" => 0.6,
+            "low" => 0.3,
+            _ => fallback,
+        },
+        _ => fallback,
+    };
+
+    value.clamp(0.0, 1.0)
 }

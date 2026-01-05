@@ -44,6 +44,8 @@ pub struct CaptureConfig {
     pub skip_unchanged: bool,  // 跳过无变化的画面，节省token
     #[serde(default = "default_change_threshold")]
     pub change_threshold: f32,  // 变化阈值 (0.0-1.0)，越小越敏感
+    #[serde(default = "default_recent_summary_limit")]
+    pub recent_summary_limit: usize,  // 近期摘要条数（用于上下文参考）
 }
 
 fn default_skip_unchanged() -> bool {
@@ -52,6 +54,10 @@ fn default_skip_unchanged() -> bool {
 
 fn default_change_threshold() -> f32 {
     0.95  // 相似度超过95%认为无变化
+}
+
+fn default_recent_summary_limit() -> usize {
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +94,7 @@ impl Default for Config {
                 compress_quality: 80,
                 skip_unchanged: true,   // 默认启用，节省token
                 change_threshold: 0.95, // 相似度阈值
+                recent_summary_limit: 8,
             },
             storage: StorageConfig {
                 retention_days: 7,
@@ -108,6 +115,8 @@ pub struct SummaryRecord {
     pub app: String,
     pub action: String,
     pub keywords: Vec<String>,
+    #[serde(default)]
+    pub confidence: f32,
     #[serde(default)]
     pub detail_ref: String,
 }
@@ -158,6 +167,7 @@ impl StorageManager {
             self.data_dir.clone(),
             self.data_dir.join("summaries"),
             self.data_dir.join("aggregated"),
+            self.data_dir.join("profiles"),
         ];
 
         for dir in dirs {
@@ -191,6 +201,68 @@ impl StorageManager {
             .map_err(|e| format!("序列化配置失败: {}", e))?;
         fs::write(&config_path, content)
             .map_err(|e| format!("保存配置失败: {}", e))
+    }
+
+    // ============ 配置方案管理 ============
+
+    pub fn list_profiles(&self) -> Result<Vec<String>, String> {
+        self.ensure_dirs()?;
+        let profiles_dir = self.data_dir.join("profiles");
+
+        let mut profiles = Vec::new();
+        let entries = fs::read_dir(&profiles_dir)
+            .map_err(|e| format!("读取配置方案失败: {}", e))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取配置方案失败: {}", e))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                profiles.push(name.to_string());
+            }
+        }
+
+        profiles.sort();
+        Ok(profiles)
+    }
+
+    pub fn save_profile(&self, name: &str, config: &Config) -> Result<(), String> {
+        self.ensure_dirs()?;
+        let safe_name = sanitize_profile_name(name)?;
+        let path = self.profile_path(&safe_name)?;
+        let content = serde_json::to_string_pretty(config)
+            .map_err(|e| format!("序列化配置方案失败: {}", e))?;
+        fs::write(&path, content)
+            .map_err(|e| format!("保存配置方案失败: {}", e))
+    }
+
+    pub fn load_profile(&self, name: &str) -> Result<Config, String> {
+        self.ensure_dirs()?;
+        let safe_name = sanitize_profile_name(name)?;
+        let path = self.profile_path(&safe_name)?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("读取配置方案失败: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("解析配置方案失败: {}", e))
+    }
+
+    pub fn delete_profile(&self, name: &str) -> Result<(), String> {
+        self.ensure_dirs()?;
+        let safe_name = sanitize_profile_name(name)?;
+        let path = self.profile_path(&safe_name)?;
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| format!("删除配置方案失败: {}", e))?;
+        }
+        Ok(())
+    }
+
+    fn profile_path(&self, name: &str) -> Result<PathBuf, String> {
+        if name.is_empty() {
+            return Err("配置名不能为空".to_string());
+        }
+        Ok(self.data_dir.join("profiles").join(format!("{}.json", name)))
     }
 
     // ============ 原始记录管理 ============
@@ -287,7 +359,7 @@ impl StorageManager {
                 *all_keywords.entry(kw.clone()).or_insert(0) += 1;
             }
 
-            if record.action == "error" {
+            if record.action == "error" || record.action == "issue" {
                 has_errors = true;
                 error_messages.push(record.summary.clone());
             }
@@ -419,6 +491,41 @@ impl StorageManager {
         serde_json::from_str(&content)
             .map_err(|e| format!("解析失败: {}", e))
     }
+}
+
+fn sanitize_profile_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    let base = trimmed.strip_suffix(".json").unwrap_or(trimmed).trim();
+
+    if base.is_empty() {
+        return Err("配置名不能为空".to_string());
+    }
+    if base.len() > 64 {
+        return Err("配置名过长".to_string());
+    }
+    if base == "." || base == ".." {
+        return Err("配置名不可用".to_string());
+    }
+    if base.ends_with(' ') || base.ends_with('.') {
+        return Err("配置名不能以空格或句点结尾".to_string());
+    }
+
+    let invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+    if base.chars().any(|c| c.is_control() || invalid_chars.contains(&c)) {
+        return Err("配置名包含非法字符".to_string());
+    }
+
+    let upper = base.to_uppercase();
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if reserved.contains(&upper.as_str()) {
+        return Err("配置名不可用".to_string());
+    }
+
+    Ok(base.to_string())
 }
 
 // ============ 搜索相关结构 ============

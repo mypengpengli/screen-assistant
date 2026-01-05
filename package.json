@@ -10,19 +10,20 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "vue": "^3.4.0",
-    "vue-router": "^4.2.5",
-    "pinia": "^2.1.7",
-    "naive-ui": "^2.38.0",
-    "@vueuse/core": "^10.7.0",
     "@tauri-apps/api": "^2.0.0",
-    "@vicons/ionicons5": "^0.12.0"
+    "@vicons/ionicons5": "^0.12.0",
+    "@vueuse/core": "^10.7.0",
+    "naive-ui": "^2.38.0",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.0",
+    "vue-router": "^4.2.5"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
+    "@tauri-apps/cli": "^2.0.0",
     "@vitejs/plugin-vue": "^5.0.0",
     "typescript": "^5.3.0",
     "vite": "^5.0.0",
-    "vue-tsc": "^1.8.0",
-    "@tauri-apps/cli": "^2.0.0"
+    "vue-tsc": "^1.8.0"
   }
 }
