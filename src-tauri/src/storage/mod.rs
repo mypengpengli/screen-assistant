@@ -660,7 +660,7 @@ impl SearchResult {
                 current_len += line.len();
 
                 if include_detail && !record.detail.is_empty() {
-                    let detail_text = record.detail.replace('\n', ' ');
+                    let detail_text = record.detail.replace('\n', " ");
                     let detail_line = format!("  细节: {}\n", detail_text);
                     if current_len + detail_line.len() > max_chars {
                         context.push_str("  ...(细节已省略)\n");
