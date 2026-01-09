@@ -50,10 +50,12 @@ Vue Frontend (IPC) → Tauri Commands → Rust Backend
 | `commands/mod.rs` | Tauri IPC command handlers - entry point for all frontend calls |
 | `capture/mod.rs` | Screen capture loop with perceptual hash comparison to skip unchanged frames |
 | `capture/screen.rs` | Screenshot capture and base64 encoding |
+| `capture/scheduler.rs` | Tokio-based interval scheduler with stop channel |
 | `model/mod.rs` | ModelManager - unified AI model interface |
 | `model/api.rs` | OpenAI/Claude API client |
 | `model/ollama.rs` | Ollama local model client |
 | `storage/mod.rs` | Config, SummaryRecord, AggregatedRecord, smart search |
+| `analysis/diff.rs` | Text similarity comparison (Jaccard index) for change detection |
 | `assistant/` | Intent parsing and context building for chat |
 
 ### Key Frontend Files (`src/`)
