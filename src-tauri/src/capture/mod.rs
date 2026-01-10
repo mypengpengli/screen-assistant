@@ -9,7 +9,7 @@ use crate::storage::{Config, StorageManager, SummaryRecord};
 use chrono::{DateTime, Duration, Local};
 use image::DynamicImage;
 use parking_lot::Mutex as ParkingMutex;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
@@ -21,7 +21,8 @@ pub struct CaptureManager {
     record_count: Arc<ParkingMutex<u64>>,
     skip_count: Arc<ParkingMutex<u64>>,  // 跳过的帧数
     stop_tx: Option<mpsc::Sender<()>>,
-    recent_alerts: Arc<ParkingMutex<HashSet<String>>>,
+    recent_alerts: Arc<ParkingMutex<HashMap<String, DateTime<Local>>>>,
+    last_issue_key: Arc<ParkingMutex<Option<String>>>,
 }
 
 impl CaptureManager {
@@ -31,7 +32,8 @@ impl CaptureManager {
             record_count: Arc::new(ParkingMutex::new(0)),
             skip_count: Arc::new(ParkingMutex::new(0)),
             stop_tx: None,
-            recent_alerts: Arc::new(ParkingMutex::new(HashSet::new())),
+            recent_alerts: Arc::new(ParkingMutex::new(HashMap::new())),
+            last_issue_key: Arc::new(ParkingMutex::new(None)),
         }
     }
 
@@ -59,6 +61,7 @@ impl CaptureManager {
         let record_count = self.record_count.clone();
         let skip_count = self.skip_count.clone();
         let recent_alerts = self.recent_alerts.clone();
+        let last_issue_key = self.last_issue_key.clone();
         let interval_ms = config.capture.interval_ms;
 
         *is_running.lock() = true;
@@ -72,12 +75,6 @@ impl CaptureManager {
 
             // 上一帧的图像哈希（用于对比）
             let mut prev_image_hash: Option<u64> = None;
-            let mut cleanup_counter = 0u32;
-            let alert_cooldown_ticks = compute_alert_cooldown_ticks(
-                config.capture.alert_cooldown_seconds,
-                interval_ms,
-            );
-
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -91,6 +88,7 @@ impl CaptureManager {
                             &model_manager,
                             &storage_manager,
                             &recent_alerts,
+                            &last_issue_key,
                             &app_handle,
                             &mut prev_image_hash,
                         ).await {
@@ -106,11 +104,6 @@ impl CaptureManager {
                             }
                         }
 
-                        cleanup_counter += 1;
-                        if cleanup_counter >= alert_cooldown_ticks {
-                            recent_alerts.lock().clear();
-                            cleanup_counter = 0;
-                        }
                     }
                     _ = stop_rx.recv() => {
                         break;
@@ -187,7 +180,8 @@ async fn capture_and_analyze_with_diff(
     config: &Config,
     model_manager: &ModelManager,
     storage_manager: &StorageManager,
-    recent_alerts: &Arc<ParkingMutex<HashSet<String>>>,
+    recent_alerts: &Arc<ParkingMutex<HashMap<String, DateTime<Local>>>>,
+    last_issue_key: &Arc<ParkingMutex<Option<String>>>,
     app_handle: &AppHandle,
     prev_hash: &mut Option<u64>,
 ) -> Result<bool, String> {
@@ -267,7 +261,14 @@ async fn capture_and_analyze_with_diff(
     {
         Ok(result) => result,
         Err(err) => {
-            emit_model_error_once(recent_alerts, app_handle, &err, "capture");
+            emit_model_error_once(
+                recent_alerts,
+                app_handle,
+                &err,
+                "capture",
+                now,
+                config.capture.alert_cooldown_seconds,
+            );
             return Err(err);
         }
     };
@@ -281,18 +282,21 @@ async fn capture_and_analyze_with_diff(
         parsed.issue_message.clone()
     };
     let mut should_emit = false;
+    let mut current_issue_key: Option<String> = None;
 
-    if parsed.has_issue && parsed.confidence >= alert_threshold {
-        let error_key = format!("{}:{}", &parsed.issue_type, &issue_message);
-        should_emit = {
-            let mut alerts = recent_alerts.lock();
-            if alerts.contains(&error_key) {
-                false
-            } else {
-                alerts.insert(error_key);
-                true
-            }
-        };
+    if parsed.has_issue && parsed.confidence >= alert_threshold && !should_suppress_alert(&parsed) {
+        let alert_key = build_alert_key(&parsed, &issue_message);
+        current_issue_key = Some(alert_key.clone());
+
+        let last_key = last_issue_key.lock().clone();
+        if last_key.as_deref() != Some(alert_key.as_str()) {
+            should_emit = should_emit_alert(
+                recent_alerts,
+                &alert_key,
+                now,
+                config.capture.alert_cooldown_seconds,
+            );
+        }
 
         if should_emit && parsed.suggestion.trim().is_empty() {
             match generate_issue_suggestion(&model_manager, &config, &recent_context, &parsed).await {
@@ -304,6 +308,8 @@ async fn capture_and_analyze_with_diff(
             }
         }
     }
+
+    *last_issue_key.lock() = current_issue_key;
 
     // 6. 保存摘要
     let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -366,26 +372,99 @@ pub struct AssistantAlert {
     pub suggestion: String,
 }
 
+fn should_suppress_alert(parsed: &AnalysisResult) -> bool {
+    let app = parsed.app.to_lowercase();
+    let combined = format!(
+        "{} {} {} {}",
+        parsed.app,
+        parsed.summary,
+        parsed.detail,
+        parsed.issue_message
+    )
+    .to_lowercase();
+
+    let markers = ["历史", "对话", "聊天", "提醒", "警告", "设置"];
+    let has_marker = markers.iter().any(|marker| combined.contains(marker));
+
+    if app.contains("screen assistant") {
+        return has_marker;
+    }
+
+    if (app.is_empty() || app == "unknown") && combined.contains("screen assistant") {
+        return has_marker;
+    }
+
+    false
+}
+
+fn build_alert_key(parsed: &AnalysisResult, issue_message: &str) -> String {
+    let issue_type = normalize_key(&parsed.issue_type);
+    if !issue_type.is_empty() {
+        return issue_type;
+    }
+    normalize_issue_text(issue_message)
+}
+
+fn normalize_key(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+fn normalize_issue_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+
+    for ch in text.trim().chars() {
+        if ch.is_ascii_digit() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+            continue;
+        }
+
+        out.push(ch.to_ascii_lowercase());
+        last_space = false;
+    }
+
+    out.trim().to_string()
+}
+
+fn should_emit_alert(
+    recent_alerts: &Arc<ParkingMutex<HashMap<String, DateTime<Local>>>>,
+    alert_key: &str,
+    now: DateTime<Local>,
+    cooldown_seconds: u64,
+) -> bool {
+    let cooldown = Duration::seconds(cooldown_seconds.max(5) as i64);
+    let mut alerts = recent_alerts.lock();
+    if let Some(prev) = alerts.get(alert_key) {
+        if now.signed_duration_since(*prev) < cooldown {
+            return false;
+        }
+    }
+    alerts.insert(alert_key.to_string(), now);
+    true
+}
+
 fn emit_model_error_once(
-    recent_alerts: &Arc<ParkingMutex<HashSet<String>>>,
+    recent_alerts: &Arc<ParkingMutex<HashMap<String, DateTime<Local>>>>,
     app_handle: &AppHandle,
     detail: &str,
     source: &str,
+    now: DateTime<Local>,
+    cooldown_seconds: u64,
 ) {
     let alert = build_model_error_alert(detail, source);
     let key = format!("model:{}:{}", &alert.error_type, &alert.message);
-
-    let should_emit = {
-        let mut alerts = recent_alerts.lock();
-        if alerts.contains(&key) {
-            false
-        } else {
-            alerts.insert(key);
-            true
-        }
-    };
-
-    if should_emit {
+    if should_emit_alert(recent_alerts, &key, now, cooldown_seconds) {
         let _ = app_handle.emit("model-error", alert);
     }
 }
@@ -469,13 +548,6 @@ fn parse_analysis(analysis: &str) -> AnalysisResult {
         suggestion: String::new(),
         confidence: if has_issue { 0.4 } else { 0.2 },
     }
-}
-
-fn compute_alert_cooldown_ticks(alert_cooldown_seconds: u64, interval_ms: u64) -> u32 {
-    let cooldown_ms = alert_cooldown_seconds.max(5) * 1000;
-    let interval = interval_ms.max(1);
-    let ticks = cooldown_ms / interval;
-    if ticks == 0 { 1 } else { ticks as u32 }
 }
 
 fn extract_json_value(text: &str) -> Option<serde_json::Value> {

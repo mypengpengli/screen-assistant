@@ -245,7 +245,7 @@ onUnmounted(() => {
               </NButton>
             </NDropdown>
             <NButton size="small" secondary :loading="isHistoryLoading" @click="loadAlertHistory">
-              加载提醒
+              加载今天提醒
             </NButton>
             <NButton size="small" secondary @click="clearChat">清空</NButton>
             <NButton
